@@ -823,18 +823,22 @@ void handleRecipeDelete() {
 
 void handleTemperatureChart() {
     String html = pageHeader("Grafico Temperature");
-    html += "<canvas id='c' style='width:100%;max-width:640px;height:300px;background:#111;border-radius:8px'></canvas>";
+    html += "<canvas id='c' style='width:100%;max-width:640px;height:320px;background:#111;border-radius:8px'></canvas>";
+    html += "<p class='status' style='text-align:center'>Minuti dalla partenza (una lettura al minuto)</p>";
     html += "<script>";
     html += "const cv=document.getElementById('c');function resize(){cv.width=cv.clientWidth;cv.height=cv.clientHeight;}window.addEventListener('resize',resize);resize();";
     html += "function draw(d){const ctx=cv.getContext('2d');const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);";
-    html += "const max=500,pad=30;";
-    html += "ctx.strokeStyle='#444';ctx.beginPath();ctx.moveTo(pad,0);ctx.lineTo(pad,h-pad);ctx.lineTo(w,h-pad);ctx.stroke();";
+    html += "const max=500,padL=30,padB=34;";
+    html += "ctx.strokeStyle='#444';ctx.beginPath();ctx.moveTo(padL,0);ctx.lineTo(padL,h-padB);ctx.lineTo(w,h-padB);ctx.stroke();";
     html += "ctx.fillStyle='#888';ctx.font='11px sans-serif';";
-    html += "for(let g=0;g<=max;g+=100){const y=h-pad-(g/max)*(h-pad);ctx.fillText(g,2,y+4);ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w,y);ctx.stroke();}";
+    html += "for(let g=0;g<=max;g+=100){const y=h-padB-(g/max)*(h-padB);ctx.fillText(g,2,y+4);ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w,y);ctx.stroke();}";
+    html += "const n=d.temperatures1.length;";
+    html += "if(n>1){const step=Math.max(1,Math.round(n/6));";
+    html += "for(let i=0;i<n;i+=step){const x=padL+(i/(n-1))*(w-padL);ctx.fillStyle='#888';ctx.fillText(i,x-6,h-padB+16);}}";
     html += "function line(arr,color){if(arr.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();";
-    html += "arr.forEach((v,i)=>{const x=pad+(i/(arr.length-1))*(w-pad);const y=h-pad-(Math.min(v,max)/max)*(h-pad);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}";
-    html += "line(d.temperatures1,'#e74c3c');line(d.temperatures2,'#3498db');";
-    html += "ctx.fillStyle='#e74c3c';ctx.fillText('CIELO',w-70,14);ctx.fillStyle='#3498db';ctx.fillText('PLATEA',w-70,28);}";
+    html += "arr.forEach((v,i)=>{const x=padL+(i/(arr.length-1))*(w-padL);const y=h-padB-(Math.min(v,max)/max)*(h-padB);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}";
+    html += "line(d.temperatures1,'#3498db');line(d.temperatures2,'#e74c3c');";
+    html += "ctx.fillStyle='#3498db';ctx.fillText('CIELO',w-70,14);ctx.fillStyle='#e74c3c';ctx.fillText('PLATEA',w-70,28);}";
     html += "function update(){fetch('/temperature-data').then(r=>r.json()).then(draw);}";
     html += "update();setInterval(update,10000);";
     html += "</script>";
