@@ -40,14 +40,16 @@ const int touchPin = T5;  // pulsante touch
 const int rele1 = 22;
 const int rele2 = 17;
 
-// Controllo potenza a burst lenti (PWM lentissimo): le due resistenze condividono la
-// stessa linea elettrica e non devono MAI essere accese contemporaneamente. Ognuna
-// riceve una "fetta" di tempo, dentro un periodo lento, proporzionale alla potenza
-// impostata (0-100%). Un periodo di alcuni secondi mantiene le spie al neon collegate
-// ai relè visibilmente intermittenti invece di sfarfallare a frequenza percepibile.
-const unsigned long PWM_PERIOD_MS = 6000;
-float potenza1 = 100.0; // percentuale di potenza manuale per il relè 1 (CIELO)
-float potenza2 = 100.0; // percentuale di potenza manuale per il relè 2 (PLATEA)
+// Controllo potenza tramite PWM lento a 2Hz (periodo 500ms): ogni relè viene
+// pilotato in modo indipendente con un duty cycle proprio, cosi' la spia al
+// neon collegata resta visibilmente intermittente. CIELO (2,2kW) e PLATEA
+// (0,9kW) possono essere accese insieme.
+const unsigned long PWM_PERIOD_MS = 500; // 2Hz
+const float RELE1_POWER_KW = 2.2; // CIELO
+const float RELE2_POWER_KW = 0.9; // PLATEA
+const float ENERGY_PRICE_EUR_KWH = 0.40;
+float potenza1 = 100.0; // percentuale di potenza manuale per il relè 1 (CIELO), usata a target raggiunto
+float potenza2 = 100.0; // percentuale di potenza manuale per il relè 2 (PLATEA), usata a target raggiunto
 bool demand1 = false;   // true se la zona 1 ha bisogno di calore (fuori dalla banda di isteresi)
 bool demand2 = false;
 bool rele1Status = false; // stato corrente del relè 1 (calcolato dallo scheduler)
@@ -507,15 +509,24 @@ if (startChrono) {
 
 
 }
-euroTotal = (((rele2MinutesTotal / 60.0 ) * 0.9 * 0.4 ) + ((rele1MinutesTotal  / 60.0 ) * 2.5 * 0.40)) ;
+euroTotal = ((rele2MinutesTotal / 60.0) * RELE2_POWER_KW + (rele1MinutesTotal / 60.0) * RELE1_POWER_KW) * ENERGY_PRICE_EUR_KWH;
 euroTotalDecimali = (int)((euroTotal - (int)euroTotal) * 100);
 
 }
 
-// Decide se le due zone hanno bisogno di calore (isteresi) e le pilota con un
-// burst-fire lento: mai entrambi i relè accesi insieme (condividono la stessa
-// linea elettrica), ognuno riceve una fetta di tempo proporzionale alla propria
-// potenza impostata (potenza1/potenza2, 0-100%) dentro un periodo di PWM_PERIOD_MS.
+// Decide se le due zone hanno bisogno di calore (isteresi di sicurezza) e calcola
+// la potenza (%) da erogare a ciascuna in base alla fase di cottura:
+//  1) lontani dal target (>40 gradi dal setpoint CIELO): preriscaldo a spinta
+//     massima, CIELO 50% fisso e PLATEA 100% fisso;
+//  2) avvicinamento (entro 40 gradi dal target CIELO, ma non ancora entrambe
+//     a target): CIELO alla potenza impostata dall'utente, PLATEA 50% fisso;
+//  3) mantenimento (entrambe le zone a target): ciascuna alla propria potenza
+//     impostata, tranne che se il CIELO e' oltre il 70% e la PLATEA deve
+//     riaccendersi, nel qual caso il CIELO viene abbassato al 50% per
+//     contenere l'assorbimento combinato.
+// Ogni relè viene poi pilotato in modo indipendente (possono stare accesi
+// insieme) con un PWM lento a 2Hz (PWM_PERIOD_MS), cosi' le spie al neon
+// restano visibilmente intermittenti.
 void updateRelayControl(unsigned long now) {
     if (temperature1 <= tempimpostata1 - deltaT1 || countdown > 0) demand1 = true;
     if (temperature1 > tempimpostata1 + deltaT1) demand1 = false;
@@ -524,21 +535,30 @@ void updateRelayControl(unsigned long now) {
     if (temperature2 <= tempimpostata2 - deltaT2) demand2 = true;
     if (temperature2 > tempimpostata2 + deltaT2) demand2 = false;
 
-    float p1 = constrain(potenza1, 0.0f, 100.0f);
-    float p2 = constrain(potenza2, 0.0f, 100.0f);
-    unsigned long slice1 = demand1 ? (unsigned long)(PWM_PERIOD_MS * (p1 / 100.0f)) : 0;
-    unsigned long slice2 = demand2 ? (unsigned long)(PWM_PERIOD_MS * (p2 / 100.0f)) : 0;
-    if (slice1 + slice2 > PWM_PERIOD_MS) {
-        // La somma delle due fette non deve mai superare il periodo: si condividono
-        // il tempo disponibile proporzionalmente, restando comunque mutuamente esclusive.
-        float scale = (float)PWM_PERIOD_MS / (float)(slice1 + slice2);
-        slice1 = (unsigned long)(slice1 * scale);
-        slice2 = PWM_PERIOD_MS - slice1;
+    float dist1 = tempimpostata1 - temperature1;
+    bool bothReached = (temperature1 >= tempimpostata1) && (temperature2 >= tempimpostata2);
+
+    float targetPower1, targetPower2;
+    if (dist1 > 40) {
+        targetPower1 = 50;
+        targetPower2 = 100;
+    } else if (!bothReached) {
+        targetPower1 = constrain(potenza1, 0.0f, 100.0f);
+        targetPower2 = 50;
+    } else {
+        targetPower1 = constrain(potenza1, 0.0f, 100.0f);
+        targetPower2 = constrain(potenza2, 0.0f, 100.0f);
+        if (targetPower1 > 70 && demand2) {
+            targetPower1 = 50;
+        }
     }
 
     unsigned long phase = now % PWM_PERIOD_MS;
-    rele1Status = phase < slice1;
-    rele2Status = !rele1Status && (phase < slice1 + slice2);
+    unsigned long onTime1 = (unsigned long)(PWM_PERIOD_MS * (targetPower1 / 100.0f));
+    unsigned long onTime2 = (unsigned long)(PWM_PERIOD_MS * (targetPower2 / 100.0f));
+
+    rele1Status = demand1 && (phase < onTime1);
+    rele2Status = demand2 && (phase < onTime2);
 
     digitalWrite(rele1, rele1Status ? HIGH : LOW);
     digitalWrite(rele2, rele2Status ? HIGH : LOW);
@@ -636,7 +656,7 @@ void handleMonitor() {
 
 void handlePowerPage() {
     String html = pageHeader("Potenza resistenze");
-    html += "<p class='status'>Potenza erogata a burst lenti (periodo " + String(PWM_PERIOD_MS / 1000) + "s): la spia al neon lampeggia visibilmente seguendo il duty cycle. Le due resistenze non sono mai accese insieme.</p>";
+    html += "<p class='status'>Potenza applicata quando entrambe le zone hanno raggiunto il target (PWM a 2Hz, la spia al neon segue il duty cycle). Durante il preriscaldo e l'avvicinamento al target la potenza è gestita automaticamente: CIELO 50% / PLATEA 100% se si è a più di 40&deg; dal target, poi CIELO alla % qui impostata / PLATEA 50% fino al raggiungimento di entrambe. Se il CIELO è oltre il 70%, quando la PLATEA si riaccende il CIELO viene abbassato al 50%.</p>";
     html += "<form class='card' action='/setpower' method='POST'>";
     html += "<label>Potenza CIELO: <span id='v1'>" + String(potenza1, 0) + "</span>%";
     html += "<input type='range' min='0' max='100' name='potenza1' value='" + String(potenza1, 0) + "' oninput=\"v1.textContent=this.value\"></label>";

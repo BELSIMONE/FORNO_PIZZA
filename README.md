@@ -10,7 +10,7 @@ ricette salvabili e aggiornamento firmware via OTA.
 - Display **TFT ST7735** (SPI) per temperature, timer, costo stimato e IP
 - 2x termocoppia tipo K con moduli **MAX6675** (CIELO e PLATEA), sullo stesso bus SPI software,
   lette a rotazione
-- 2x relè allo stato solido (SSR) che pilotano le resistenze CIELO e PLATEA
+- 2x relè allo stato solido (SSR) che pilotano le resistenze CIELO (2,2 kW) e PLATEA (0,9 kW)
 - Pulsante **touch capacitivo** (pin `T5`) per impostare un timer di cottura
 - Buzzer per segnalazioni acustiche a fine timer
 
@@ -35,11 +35,20 @@ ricette salvabili e aggiornamento firmware via OTA.
 
 - **Controllo temperatura a isteresi** per entrambe le zone, con soglia di sicurezza
   (spegnimento forzato oltre +20°C dal setpoint)
-- **Potenza regolabile (0-100%) a burst-fire lento**: le due resistenze condividono la
-  stessa linea elettrica e non vengono mai accese insieme. Ognuna riceve una "fetta" di
-  tempo proporzionale alla potenza impostata dentro un periodo lento (6s di default),
-  cosi' le spie al neon collegate ai relè restano visibilmente intermittenti invece di
-  sfarfallare a frequenza impercettibile. Regolabile da `/power`.
+- **Potenza regolabile (0-100%) a PWM lento (2Hz)**, applicata in tre fasi in base
+  a quanto manca al target del CIELO:
+  1. **Preriscaldo** (oltre 40°C dal target CIELO): CIELO fisso al 50%, PLATEA
+     fissa al 100%
+  2. **Avvicinamento** (entro 40°C dal target CIELO, ma non ancora entrambe le
+     zone a target): CIELO alla potenza impostata dall'utente, PLATEA fissa al 50%
+  3. **Mantenimento** (entrambe le zone a target): ciascuna alla propria potenza
+     impostata; se il CIELO è oltre il 70% e la PLATEA deve riaccendersi, il
+     CIELO viene abbassato al 50% per contenere l'assorbimento combinato
+
+  Le due resistenze possono essere accese contemporaneamente. Ogni relè è
+  pilotato in modo indipendente con un duty cycle proprio su un periodo di
+  500ms (2Hz), cosi' la spia al neon collegata resta visibilmente intermittente
+  invece di sfarfallare. Potenza regolabile da `/power`.
 - **Ricette salvabili**: nome + temperature + potenza delle due zone, salvate su
   filesystem (LittleFS) e richiamabili dall'interfaccia web (`/recipes`)
 - **Timer di cottura** avviabile dal pulsante touch (+60s per tocco), con conto alla
@@ -101,9 +110,10 @@ pio run -e ota -t upload
 
 ## Note di sicurezza elettrica
 
-Il firmware presume che le due resistenze (CIELO e PLATEA) condividano la stessa
-linea/interruttore e non possano essere alimentate insieme a piena potenza: per
-questo il controllo a burst-fire garantisce mutua esclusione (mai entrambi i relè
-accesi nello stesso istante). Se l'impianto elettrico del forno cambia (es. linee
-indipendenti), questo vincolo va rivisto nella funzione `updateRelayControl()` in
-`src/main.cpp`.
+Le due resistenze (CIELO 2,2kW, PLATEA 0,9kW) possono essere accese
+contemporaneamente. L'unico limite imposto dal firmware è che, in fase di
+mantenimento, se il CIELO è impostato oltre il 70% e la PLATEA deve
+riaccendersi, il CIELO viene temporaneamente abbassato al 50% per contenere
+l'assorbimento combinato (vedi `updateRelayControl()` in `src/main.cpp`). Se
+l'impianto elettrico o le potenze delle resistenze cambiano, questa logica va
+rivista di conseguenza.
