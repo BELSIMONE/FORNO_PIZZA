@@ -10,6 +10,8 @@
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <vector>
 #include "secrets.h"
 
@@ -35,24 +37,37 @@ std::vector<float> temperatureReadings2;
 const int maxReadings = 120;
 const int buzzerPin = 33 ;  //  buzzer
 const int touchPin = T5;  // pulsante touch
-const int rele1 = 22; 
+const int rele1 = 22;
 const int rele2 = 17;
-    static bool rele2Priority = true;
-    static unsigned long rele1LastChangeTime = 0;
-    static bool rele1Status = false;
-    static unsigned long rele2LastChangeTime = 0;
-    static bool rele2Status = false;
+
+// Controllo potenza a burst lenti (PWM lentissimo): le due resistenze condividono la
+// stessa linea elettrica e non devono MAI essere accese contemporaneamente. Ognuna
+// riceve una "fetta" di tempo, dentro un periodo lento, proporzionale alla potenza
+// impostata (0-100%). Un periodo di alcuni secondi mantiene le spie al neon collegate
+// ai relè visibilmente intermittenti invece di sfarfallare a frequenza percepibile.
+const unsigned long PWM_PERIOD_MS = 6000;
+float potenza1 = 100.0; // percentuale di potenza manuale per il relè 1 (CIELO)
+float potenza2 = 100.0; // percentuale di potenza manuale per il relè 2 (PLATEA)
+bool demand1 = false;   // true se la zona 1 ha bisogno di calore (fuori dalla banda di isteresi)
+bool demand2 = false;
+bool rele1Status = false; // stato corrente del relè 1 (calcolato dallo scheduler)
+bool rele2Status = false;
+
 // Definizione dei pin per la termocoppia
-int thermoDO = 15; 
-int thermoCS = 21; 
-int thermoCLK = 4; 
-int thermoCS2 = 2; 
+int thermoDO = 15;
+int thermoCS = 21;
+int thermoCLK = 4;
+int thermoCS2 = 2;
 // Creazione degli oggetti MAX6675
 MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
 MAX6675 thermocouple2(thermoCLK, thermoCS2, thermoDO);
 
 WebServer server(80);
 Preferences preferences;
+
+// Ricette salvate su LittleFS come array JSON: [{"name","temp1","temp2","potenza1","potenza2"}, ...]
+const char *RECIPES_FILE = "/recipes.json";
+const size_t MAX_RECIPES = 20;
 
 unsigned long lastUpdateTime = 0;
 const long updateInterval = 60000; // Intervallo di aggiornamento in millisecondi (60000 ms = 1 minuto)
@@ -136,6 +151,23 @@ int melodies[][8] = {
   {2093, 1976, 1760, 1568, 1397, 1319, 1175, 1047}  // Melodia 8 (tre ottave più alte) - "Melodia 8"
 };
 
+// CSS condiviso da tutte le pagine web (dark theme, leggibile da smartphone in cucina)
+const char COMMON_CSS[] PROGMEM =
+    "body{font-family:Arial,sans-serif;background:#1b1b1b;color:#eee;margin:0;padding:0 12px 24px}"
+    "nav{background:#222;padding:10px 12px;margin:0 -12px 16px;display:flex;flex-wrap:wrap;gap:8px}"
+    "nav a{color:#fff;text-decoration:none;padding:8px 12px;background:#333;border-radius:6px;font-size:14px}"
+    "nav a:hover{background:#c0392b}"
+    "h1{font-size:22px}"
+    "label{display:block;margin-top:14px;font-size:15px}"
+    "input[type=number],input[type=text]{font-size:16px;padding:8px;width:100%;max-width:220px;box-sizing:border-box;border-radius:6px;border:1px solid #444;background:#222;color:#eee;margin-top:4px}"
+    "input[type=range]{width:100%;max-width:320px}"
+    "button,input[type=submit]{font-size:16px;padding:10px 18px;margin-top:14px;margin-right:8px;border:none;border-radius:6px;background:#c0392b;color:#fff;cursor:pointer}"
+    "button:hover,input[type=submit]:hover{background:#e74c3c}"
+    ".card{background:#242424;border-radius:10px;padding:16px;margin-bottom:14px;max-width:480px}"
+    ".big{font-size:34px;font-weight:bold}"
+    ".status{font-size:13px;opacity:.7}"
+    "table{border-collapse:collapse;width:100%;max-width:560px}"
+    "td,th{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:14px}";
 
 void saveSettings();
 void loadSettings();
@@ -145,15 +177,28 @@ void handleMonitor();
 void handleTemperatureChart();
 void handleTemperatureData();
 void handleSetTemp();
+void handlePowerPage();
+void handleSetPower();
+void handleRecipesPage();
+void handleRecipesList();
+void handleRecipeSave();
+void handleRecipeLoad();
+void handleRecipeDelete();
+void handleStatus();
 void updateDisplay();
+void updateRelayControl(unsigned long now);
 void playBuzzer(int frequency, int duration);
 void onWiFiEvent(WiFiEvent_t event);
 void startAccessPoint();
+String pageHeader(const String &title);
+String pageFooter();
 
 void saveSettings() {
     preferences.begin("my-app", false);
     preferences.putFloat("tempimpostata1", tempimpostata1);
     preferences.putFloat("tempimpostata2", tempimpostata2);
+    preferences.putFloat("potenza1", potenza1);
+    preferences.putFloat("potenza2", potenza2);
     preferences.end();
 }
 
@@ -161,6 +206,8 @@ void loadSettings() {
     preferences.begin("my-app", true);
     tempimpostata1 = preferences.getFloat("tempimpostata1", 400); // Default 400
     tempimpostata2 = preferences.getFloat("tempimpostata2", 300); // Default 300
+    potenza1 = preferences.getFloat("potenza1", 100);
+    potenza2 = preferences.getFloat("potenza2", 100);
     preferences.end();
 }
 
@@ -199,8 +246,13 @@ void setup() {
   tft.initR(INITR_BLACKTAB);   // Inizializza il display ST7735
   tft.setRotation(0);          // Ruota il display se necessario
   tft.fillScreen(ST7735_BLACK); // Imposta lo sfondo a nero
-  
+
   pinMode(buzzerPin, OUTPUT);
+
+  // Filesystem per le ricette salvate (formatta automaticamente se assente/corrotto)
+  if (!LittleFS.begin(true)) {
+    Serial.println("Errore inizializzazione LittleFS");
+  }
 
   // Carica subito le ultime impostazioni salvate: il forno deve poter
   // funzionare (relè, display, timer) anche se il WiFi non arriva mai.
@@ -230,10 +282,23 @@ void setup() {
   }
   WiFi.setAutoReconnect(true); // riconnessione automatica in background se la rete cade
 
+  if (MDNS.begin("mio-esp32")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS attivo: http://mio-esp32.local");
+  }
+
   // Configurazione server web
   server.on("/", HTTP_GET, monitorRoot);
+  server.on("/status", HTTP_GET, handleStatus);
   server.on("/settemp", HTTP_POST, handleSetTemp);
   server.on("/setting", HTTP_GET, handleRoot);
+  server.on("/power", HTTP_GET, handlePowerPage);
+  server.on("/setpower", HTTP_POST, handleSetPower);
+  server.on("/recipes", HTTP_GET, handleRecipesPage);
+  server.on("/api/recipes", HTTP_GET, handleRecipesList);
+  server.on("/api/recipes", HTTP_POST, handleRecipeSave);
+  server.on("/api/recipes/load", HTTP_POST, handleRecipeLoad);
+  server.on("/api/recipes/delete", HTTP_POST, handleRecipeDelete);
   server.on("/temperature", HTTP_GET, handleMonitor);
   server.on("/temperature-chart", HTTP_GET, handleTemperatureChart);
   server.on("/temperature-data", HTTP_GET, handleTemperatureData);
@@ -314,70 +379,10 @@ void loop() {
         temperatureReadings2.erase(temperatureReadings2.begin());
     }
 
-    // Controllo e attivazione del relè 1 con isteresi e condizione aggiuntiva
-    if (temperature1 <= tempimpostata1 - deltaT1 || countdown > 0  ) {
-        if ((temperature2 + 50) <= (tempimpostata2 - deltaT2)) {
-         rele2Priority = true;
-         cieloColor = ST7735_MAGENTA ;
-         if (currentMillis - rele1LastChangeTime >= 500) {
-            rele1Status = !rele1Status; // Cambia lo stato del relè 1
-            digitalWrite(rele1, rele1Status ? HIGH : LOW); // Accende o spegne il relè 1
-            rele1LastChangeTime = currentMillis; // Aggiorna il tempo dell'ultima modifica
-            //updateDisplay();
-        }
-     
-    
-    }else {
-        digitalWrite(rele1, HIGH);
-        cieloColor =  ST7735_RED ;
-        rele1Status = true;
-        rele2Priority = false;
-        }
-              
-        
-    }
-    //else  {
-    //    digitalWrite(rele1, LOW); // Spegne il relè 1
-    //    rele1Status = false;
-    //    rele2Priority = true;
-    //}
-     if (temperature1 > tempimpostata1 + deltaT1 && countdown <= 0  ) {
-        digitalWrite(rele1, LOW); // Spegne il relè 1
-        cieloColor =  ST7735_WHITE ;
-        rele1Status = false;
-        rele2Priority = true;
-    }
-     if (temperature1 > tempimpostata1 + 20   ) {
-        digitalWrite(rele1, LOW); // Spegne il relè 1
-        cieloColor =  ST7735_WHITE ;
-        rele1Status = false;
-        rele2Priority = true;
-    }
-    
-    // Controllo e attivazione del relè 2
-    if (temperature2 <= tempimpostata2 - deltaT2) {
-    if (!rele2Priority) {
-        plateaColor = ST7735_MAGENTA ;
-        if (currentMillis - rele2LastChangeTime >= 500) {
-            rele2Status = !rele2Status; // Cambia lo stato del relè 2
-            digitalWrite(rele2, rele2Status ? HIGH : LOW); // Accende o spegne il relè 2
-            rele2LastChangeTime = currentMillis; // Aggiorna il tempo dell'ultima modifica
-            //updateDisplay();
-        }
-     
-    
-    }else {
-        digitalWrite(rele2, HIGH);
-        plateaColor = ST7735_RED ;
-        rele2Status = true;
-        }
-        }
-    if (temperature2 > tempimpostata2 + deltaT2) {
-        digitalWrite(rele2, LOW);
-        plateaColor = ST7735_WHITE ;
-        rele2Status = false;
-        }
-       
+    // Controllo relè: isteresi per decidere se serve calore + burst-fire lento
+    // per erogare la potenza impostata senza mai accendere insieme le due resistenze
+    updateRelayControl(currentMillis);
+
     // Conversione delle temperature in stringhe
     dtostrf(temperature1, 4, 0, tempString1);
     dtostrf(temperature2, 4, 0, tempString2);
@@ -387,13 +392,13 @@ void loop() {
     dtostrf(rele1MinutesTotal, 4, 0, rele1TimeString);
     dtostrf(rele2MinutesTotal, 4, 0, rele2TimeString);
     dtostrf(euroTotal, 4, 2, euroTotalString);
-    
+
     // Aggiornamento display se le temperature o il timer sono cambiati
     if (strcmp(tempString1, prevTempString1) != 0 || strcmp(tempString2, prevTempString2) != 0 ||
         strcmp(tempString3, prevTempString3) != 0 || strcmp(tempString4, prevTempString4) != 0 ||
         strcmp(rele1TimeString, prevrele1TimeString) != 0 || strcmp(rele2TimeString, prevrele2TimeString) != 0 ||
         strcmp(euroTotalString, preveuroTotalString) != 0 || strcmp(timerString, prevTimerString) != 0) {
-        
+
         updateDisplay();
 
         strcpy(prevTempString1, tempString1);
@@ -439,7 +444,7 @@ void loop() {
                     playBuzzer(frequency, 200);
                     delay(200);
                 }
-                
+
              Serial.println("Fine del conto alla rovescia. Inizio conteggio tempo.");
             countingDown = false;
             startChrono = true;  // Inizia il cronometro
@@ -466,18 +471,18 @@ if (startChrono) {
         }else {if (millis() - startTimeRele1 >= 30000) {
         rele1Active = false;
         rele1MillisTotal += (millis() - startTimeRele1) ;  // Aggiorna il tempo Somma i minuti totali
-        rele1MinutesTotal = rele1MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali     
+        rele1MinutesTotal = rele1MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali
     }
     }
-    } else { 
-      
+    } else {
+
       if (rele1Active ) {
         rele1Active = false;
         rele1MillisTotal += (millis() - startTimeRele1) ;  // Aggiorna il tempo Somma i minuti totali
-        rele1MinutesTotal = rele1MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali     
+        rele1MinutesTotal = rele1MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali
     }
 
-    
+
 
 }
 
@@ -488,81 +493,139 @@ if (startChrono) {
         }else {if (millis() - startTimeRele2 >= 30000) {
         rele2Active = false;
         rele2MillisTotal += (millis() - startTimeRele2) ;  // Aggiorna il tempo Somma i minuti totali
-        rele2MinutesTotal = rele2MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali     
+        rele2MinutesTotal = rele2MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali
     }
     }
-    } else { 
-      
+    } else {
+
       if (rele2Active ) {
         rele2Active = false;
         rele2MillisTotal += (millis() - startTimeRele2) ;  // Aggiorna il tempo Somma i minuti totali
-        rele2MinutesTotal = rele2MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali     
+        rele2MinutesTotal = rele2MillisTotal / 60000;  // Aggiorna il tempo Somma i minuti totali
     }
 
-    
+
 
 }
 euroTotal = (((rele2MinutesTotal / 60.0 ) * 0.9 * 0.4 ) + ((rele1MinutesTotal  / 60.0 ) * 2.5 * 0.40)) ;
 euroTotalDecimali = (int)((euroTotal - (int)euroTotal) * 100);
 
 }
-void handleRoot() {
-    String html = "<html><head>";
+
+// Decide se le due zone hanno bisogno di calore (isteresi) e le pilota con un
+// burst-fire lento: mai entrambi i relè accesi insieme (condividono la stessa
+// linea elettrica), ognuno riceve una fetta di tempo proporzionale alla propria
+// potenza impostata (potenza1/potenza2, 0-100%) dentro un periodo di PWM_PERIOD_MS.
+void updateRelayControl(unsigned long now) {
+    if (temperature1 <= tempimpostata1 - deltaT1 || countdown > 0) demand1 = true;
+    if (temperature1 > tempimpostata1 + deltaT1) demand1 = false;
+    if (temperature1 > tempimpostata1 + 20) demand1 = false; // sicurezza: mai oltre +20 gradi dal setpoint
+
+    if (temperature2 <= tempimpostata2 - deltaT2) demand2 = true;
+    if (temperature2 > tempimpostata2 + deltaT2) demand2 = false;
+
+    float p1 = constrain(potenza1, 0.0f, 100.0f);
+    float p2 = constrain(potenza2, 0.0f, 100.0f);
+    unsigned long slice1 = demand1 ? (unsigned long)(PWM_PERIOD_MS * (p1 / 100.0f)) : 0;
+    unsigned long slice2 = demand2 ? (unsigned long)(PWM_PERIOD_MS * (p2 / 100.0f)) : 0;
+    if (slice1 + slice2 > PWM_PERIOD_MS) {
+        // La somma delle due fette non deve mai superare il periodo: si condividono
+        // il tempo disponibile proporzionalmente, restando comunque mutuamente esclusive.
+        float scale = (float)PWM_PERIOD_MS / (float)(slice1 + slice2);
+        slice1 = (unsigned long)(slice1 * scale);
+        slice2 = PWM_PERIOD_MS - slice1;
+    }
+
+    unsigned long phase = now % PWM_PERIOD_MS;
+    rele1Status = phase < slice1;
+    rele2Status = !rele1Status && (phase < slice1 + slice2);
+
+    digitalWrite(rele1, rele1Status ? HIGH : LOW);
+    digitalWrite(rele2, rele2Status ? HIGH : LOW);
+
+    cieloColor = !demand1 ? ST7735_WHITE : (rele1Status ? ST7735_RED : ST7735_MAGENTA);
+    plateaColor = !demand2 ? ST7735_WHITE : (rele2Status ? ST7735_RED : ST7735_MAGENTA);
+}
+
+String pageHeader(const String &title) {
+    String html;
+    html.reserve(600);
+    html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
     html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    html += "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>";
-    html += "<style>";
-    html += "body { font-size: 16px; }";
-    html += "button { font-size: 16px; padding: 10px; }";
-    html += "</style>";
+    html += "<title>" + title + " - Forno Pizza</title>";
+    html += "<style>" + String(COMMON_CSS) + "</style>";
     html += "</head><body>";
-    html += "<h1>Impostazioni Temperatura</h1>";
-    html += "<form action='/settemp' method='POST'>";
-    html += "Temperatura Impostata 1: <input type='number' name='temp1' value='" + String(tempimpostata1) + "'><br>";
-    html += "Temperatura Impostata 2: <input type='number' name='temp2' value='" + String(tempimpostata2) + "'><br>";
+    html += "<nav>";
+    html += "<a href='/'>Monitor</a>";
+    html += "<a href='/setting'>Temperature</a>";
+    html += "<a href='/power'>Potenza</a>";
+    html += "<a href='/recipes'>Ricette</a>";
+    html += "<a href='/temperature-chart'>Grafico</a>";
+    html += "</nav>";
+    html += "<h1>" + title + "</h1>";
+    return html;
+}
+
+String pageFooter() {
+    return "</body></html>";
+}
+
+void handleRoot() {
+    String html = pageHeader("Temperature");
+    html += "<form class='card' action='/settemp' method='POST'>";
+    html += "<label>Setpoint CIELO (&deg;C)<input type='number' step='1' name='temp1' value='" + String(tempimpostata1, 0) + "'></label>";
+    html += "<label>Setpoint PLATEA (&deg;C)<input type='number' step='1' name='temp2' value='" + String(tempimpostata2, 0) + "'></label>";
     html += "<input type='submit' value='Salva'>";
     html += "</form>";
-
-    // Aggiungi qui il pulsante per la pagina di monitoraggio
-    html += "<p><a href='/'><button>Torna alla Pagina di Monitoraggio</button></a></p>";
-
-    html += "</body></html>";
+    html += pageFooter();
     server.send(200, "text/html", html);
 }
 
 void monitorRoot() {
-    String html = "<html><head>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    html += "<script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>";
-    html += "<style>";
-    html += "body { font-size: 16px; }";
-    html += "button { font-size: 16px; padding: 10px; }";
-    html += "</style>";
+    String html = pageHeader("Monitor");
+    html += "<div class='card'><div>CIELO</div><div class='big' id='t1'>--</div>";
+    html += "<div class='status'>Setpoint <span id='s1'>--</span>&deg;C &middot; Potenza <span id='p1'>--</span>% &middot; <span id='r1'>-</span></div></div>";
+    html += "<div class='card'><div>PLATEA</div><div class='big' id='t2'>--</div>";
+    html += "<div class='status'>Setpoint <span id='s2'>--</span>&deg;C &middot; Potenza <span id='p2'>--</span>% &middot; <span id='r2'>-</span></div></div>";
+    html += "<div class='card'><div class='status'>Costo stimato</div><div class='big'>&euro; <span id='euro'>--</span></div>";
+    html += "<div class='status' id='wifiInfo'>--</div></div>";
     html += "<script>";
-    html += "function updateTemperatures() {";
-    html += "  var xhttp = new XMLHttpRequest();";
-    html += "  xhttp.onreadystatechange = function() {";
-    html += "    if (this.readyState == 4 && this.status == 200) {";
-    html += "      var data = JSON.parse(this.responseText);";
-    html += "      document.getElementById('temp1').innerHTML = Math.round(data.temperature1);";
-    html += "      document.getElementById('temp2').innerHTML = Math.round(data.temperature2);";
-    html += "    }";
-    html += "  };";
-    html += "  xhttp.open(\"GET\", \"/temperature\", true);";
-    html += "  xhttp.send();";
-    html += "}";
-    html += "setInterval(updateTemperatures, 5000);"; // Aggiorna ogni 5 secondi
+    html += "function refresh(){fetch('/status').then(r=>r.json()).then(d=>{";
+    html += "t1.textContent=Math.round(d.t1)+'°C';t2.textContent=Math.round(d.t2)+'°C';";
+    html += "s1.textContent=Math.round(d.s1);s2.textContent=Math.round(d.s2);";
+    html += "p1.textContent=Math.round(d.p1);p2.textContent=Math.round(d.p2);";
+    html += "r1.textContent=d.r1?'ACCESO':'spento';r2.textContent=d.r2?'ACCESO':'spento';";
+    html += "euro.textContent=d.euro.toFixed(2);";
+    html += "wifiInfo.textContent='WiFi: '+d.wifi+' ('+d.ip+')';";
+    html += "});}";
+    html += "refresh();setInterval(refresh,3000);";
     html += "</script>";
-    html += "</head><body>";
-    html += "<h1>MONITOR Temperature</h1>";
-    html += "<p>Temperatura CIELO : <span id='temp1'></span> °C</p>";
-    html += "<p>Temperatura PLATEA: <span id='temp2'></span> °C</p>";
-    
-    html += "<p><a href='/setting'><button>Impostazioni Temperature</button></a></p>";
-    html += "<p><a href='/temperature-chart'><button>Grafico Temperatura</button></a></p>";
-    html += "</body></html>";
-    server.sendHeader("Content-Type", "text/html; charset=utf-8");
+    html += pageFooter();
     server.send(200, "text/html", html);
 }
+
+void handleStatus() {
+    String json;
+    json.reserve(320);
+    json += "{";
+    json += "\"t1\":" + String(temperature1, 1) + ",";
+    json += "\"t2\":" + String(temperature2, 1) + ",";
+    json += "\"s1\":" + String(tempimpostata1, 0) + ",";
+    json += "\"s2\":" + String(tempimpostata2, 0) + ",";
+    json += "\"p1\":" + String(potenza1, 0) + ",";
+    json += "\"p2\":" + String(potenza2, 0) + ",";
+    json += "\"r1\":" + String(rele1Status ? "true" : "false") + ",";
+    json += "\"r2\":" + String(rele2Status ? "true" : "false") + ",";
+    json += "\"euro\":" + String(euroTotal, 2) + ",";
+    json += "\"timer\":" + String(countdown) + ",";
+    json += "\"chrono\":" + String(startChrono ? "true" : "false") + ",";
+    json += "\"elapsed\":" + String(elapsedTime) + ",";
+    json += "\"wifi\":\"" + String(wifiApMode ? "AP" : "STA") + "\",";
+    json += "\"ip\":\"" + String(wifiApMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString()) + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
 void handleMonitor() {
   float temperature1 = thermocouple.readCelsius();
   delay(500);
@@ -570,67 +633,174 @@ void handleMonitor() {
     String json = "{\"temperature1\": " + String(temperature1) + ", \"temperature2\": " + String(temperature2) + "}";
     server.send(200, "application/json", json);
 }
-void handleTemperatureChart() {
-    String html = "<html><head>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-    html += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
-    html += "<style>";
-    html += "body { font-size: 16px; }";
-    html += "button { font-size: 16px; padding: 10px; }";
-    html += "canvas { max-width: 100%; height: auto; }"; // Rendi il canvas reattivo
-    html += "</style>";
-    html += "</head><body>";
-    html += "<h1>Grafico Temperatura</h1>";
 
-    // Contenitore del canvas senza dimensioni fisse
-    html += "<div>";
-    html += "<canvas id='tempChart'></canvas>";
+void handlePowerPage() {
+    String html = pageHeader("Potenza resistenze");
+    html += "<p class='status'>Potenza erogata a burst lenti (periodo " + String(PWM_PERIOD_MS / 1000) + "s): la spia al neon lampeggia visibilmente seguendo il duty cycle. Le due resistenze non sono mai accese insieme.</p>";
+    html += "<form class='card' action='/setpower' method='POST'>";
+    html += "<label>Potenza CIELO: <span id='v1'>" + String(potenza1, 0) + "</span>%";
+    html += "<input type='range' min='0' max='100' name='potenza1' value='" + String(potenza1, 0) + "' oninput=\"v1.textContent=this.value\"></label>";
+    html += "<label>Potenza PLATEA: <span id='v2'>" + String(potenza2, 0) + "</span>%";
+    html += "<input type='range' min='0' max='100' name='potenza2' value='" + String(potenza2, 0) + "' oninput=\"v2.textContent=this.value\"></label>";
+    html += "<input type='submit' value='Applica'>";
+    html += "</form>";
+    html += pageFooter();
+    server.send(200, "text/html", html);
+}
+
+void handleSetPower() {
+    if (server.hasArg("potenza1")) potenza1 = constrain(server.arg("potenza1").toFloat(), 0.0f, 100.0f);
+    if (server.hasArg("potenza2")) potenza2 = constrain(server.arg("potenza2").toFloat(), 0.0f, 100.0f);
+    saveSettings();
+    server.sendHeader("Location", "/power");
+    server.send(303);
+}
+
+void handleRecipesPage() {
+    String html = pageHeader("Ricette");
+    html += "<div class='card'>";
+    html += "<label>Nome ricetta<input type='text' id='recipeName' placeholder='Es. Margherita'></label>";
+    html += "<button onclick='saveRecipe()'>Salva impostazioni attuali come ricetta</button>";
     html += "</div>";
-
+    html += "<table id='recipeTable'><thead><tr><th>Nome</th><th>Cielo</th><th>Platea</th><th>Potenza</th><th></th></tr></thead><tbody></tbody></table>";
     html += "<script>";
-    html += "var ctx = document.getElementById('tempChart').getContext('2d');";
-    html += "var tempChart = new Chart(ctx, {";
-    html += "  type: 'line',";
-    html += "  data: {";
-    html += "    labels: [],";
-    html += "    datasets: [";
-    html += "      { label: 'CIELO', data: [], backgroundColor: 'rgba(255, 99, 132, 0.2)', borderColor: 'rgba(255, 99, 132, 1)', borderWidth: 1 },";
-    html += "      { label: 'PLATEA', data: [], backgroundColor: 'rgba(54, 162, 235, 0.2)', borderColor: 'rgba(54, 162, 235, 1)', borderWidth: 1 }";
-    html += "    ]";
-    html += "  },";
-    html += "  options: {";
-    html += "    scales: {";
-    html += "      y: {";
-    html += "        beginAtZero: true,";
-    html += "        min: 0,";
-    html += "        max: 500,";
-    html += "        title: {";
-    html += "          display: true,";
-    html += "          text: 'Gradi'";
-    html += "        }";
-    html += "      },";
-    html += "      x: {";
-    html += "        title: {";
-    html += "          display: true,";
-    html += "          text: 'Minuti'";
-    html += "        }";
-    html += "      }";
-    html += "    }";
-    html += "  }";
-    html += "});";
-    html += "function updateChart() {";
-    html += "  fetch('/temperature-data').then(response => response.json()).then(data => {";
-    html += "    tempChart.data.labels = data.labels;";
-    html += "    tempChart.data.datasets[0].data = data.temperatures1;"; // Temperatures1 per CIELO
-    html += "    tempChart.data.datasets[1].data = data.temperatures2;"; // Temperatures2 per PLATEA
-    html += "    tempChart.update();";
-    html += "  });";
-    html += "}";
-    html += "setInterval(updateChart, 10000);"; // Aggiorna ogni 10 secondi
+    html += "function loadList(){fetch('/api/recipes').then(r=>r.json()).then(list=>{";
+    html += "const tb=document.querySelector('#recipeTable tbody');tb.innerHTML='';";
+    html += "list.forEach(rc=>{const tr=document.createElement('tr');";
+    html += "tr.innerHTML=`<td>${rc.name}</td><td>${rc.temp1}&deg;</td><td>${rc.temp2}&deg;</td><td>${rc.potenza1}/${rc.potenza2}%</td>`+";
+    html += "`<td><button onclick=\"loadRecipe('${rc.name}')\">Carica</button> <button onclick=\"delRecipe('${rc.name}')\">Elimina</button></td>`;";
+    html += "tb.appendChild(tr);});});}";
+    html += "function saveRecipe(){const name=recipeName.value.trim();if(!name)return;";
+    html += "fetch('/status').then(r=>r.json()).then(s=>fetch('/api/recipes',{method:'POST',headers:{'Content-Type':'application/json'},";
+    html += "body:JSON.stringify({name:name,temp1:s.s1,temp2:s.s2,potenza1:s.p1,potenza2:s.p2})})).then(loadList);}";
+    html += "function loadRecipe(name){fetch('/api/recipes/load',{method:'POST',headers:{'Content-Type':'application/json'},";
+    html += "body:JSON.stringify({name:name})}).then(()=>alert('Ricetta caricata: '+name));}";
+    html += "function delRecipe(name){if(!confirm('Eliminare '+name+'?'))return;";
+    html += "fetch('/api/recipes/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name})}).then(loadList);}";
+    html += "loadList();";
     html += "</script>";
-    html += "<p><a href='/'><button>Torna alla Pagina Principale</button></a></p>";
-    html += "</body></html>";
+    html += pageFooter();
+    server.send(200, "text/html", html);
+}
 
+void handleRecipesList() {
+    File f = LittleFS.open(RECIPES_FILE, "r");
+    if (!f) { server.send(200, "application/json", "[]"); return; }
+    String content = f.readString();
+    f.close();
+    if (content.length() == 0) content = "[]";
+    server.send(200, "application/json", content);
+}
+
+void handleRecipeSave() {
+    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"error\":\"body mancante\"}"); return; }
+    JsonDocument body;
+    if (deserializeJson(body, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"json non valido\"}");
+        return;
+    }
+    String name = String((const char *)(body["name"] | ""));
+    name.trim();
+    if (name.length() == 0) { server.send(400, "application/json", "{\"error\":\"nome mancante\"}"); return; }
+
+    JsonDocument doc;
+    File f = LittleFS.open(RECIPES_FILE, "r");
+    if (f) { deserializeJson(doc, f); f.close(); }
+    if (!doc.is<JsonArray>()) doc.to<JsonArray>();
+    JsonArray arr = doc.as<JsonArray>();
+
+    JsonObject target;
+    for (JsonObject r : arr) {
+        if (String((const char *)(r["name"] | "")) == name) { target = r; break; }
+    }
+    if (target.isNull()) {
+        if (arr.size() >= MAX_RECIPES) { server.send(400, "application/json", "{\"error\":\"troppe ricette salvate\"}"); return; }
+        target = arr.add<JsonObject>();
+    }
+    target["name"] = name;
+    target["temp1"] = (float)(body["temp1"] | tempimpostata1);
+    target["temp2"] = (float)(body["temp2"] | tempimpostata2);
+    target["potenza1"] = (float)(body["potenza1"] | potenza1);
+    target["potenza2"] = (float)(body["potenza2"] | potenza2);
+
+    File out = LittleFS.open(RECIPES_FILE, "w");
+    serializeJson(doc, out);
+    out.close();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleRecipeLoad() {
+    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"error\":\"body mancante\"}"); return; }
+    JsonDocument body;
+    if (deserializeJson(body, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"json non valido\"}");
+        return;
+    }
+    String name = String((const char *)(body["name"] | ""));
+
+    JsonDocument doc;
+    File f = LittleFS.open(RECIPES_FILE, "r");
+    if (f) { deserializeJson(doc, f); f.close(); }
+
+    for (JsonObject r : doc.as<JsonArray>()) {
+        if (String((const char *)(r["name"] | "")) == name) {
+            tempimpostata1 = r["temp1"] | tempimpostata1;
+            tempimpostata2 = r["temp2"] | tempimpostata2;
+            potenza1 = r["potenza1"] | potenza1;
+            potenza2 = r["potenza2"] | potenza2;
+            saveSettings();
+            server.send(200, "application/json", "{\"ok\":true}");
+            return;
+        }
+    }
+    server.send(404, "application/json", "{\"error\":\"ricetta non trovata\"}");
+}
+
+void handleRecipeDelete() {
+    if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"error\":\"body mancante\"}"); return; }
+    JsonDocument body;
+    if (deserializeJson(body, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"json non valido\"}");
+        return;
+    }
+    String name = String((const char *)(body["name"] | ""));
+
+    JsonDocument doc;
+    File f = LittleFS.open(RECIPES_FILE, "r");
+    if (f) { deserializeJson(doc, f); f.close(); }
+    if (!doc.is<JsonArray>()) doc.to<JsonArray>();
+
+    JsonDocument filtered;
+    JsonArray outArr = filtered.to<JsonArray>();
+    for (JsonObject r : doc.as<JsonArray>()) {
+        if (String((const char *)(r["name"] | "")) != name) outArr.add(r);
+    }
+
+    File out = LittleFS.open(RECIPES_FILE, "w");
+    serializeJson(filtered, out);
+    out.close();
+    server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleTemperatureChart() {
+    String html = pageHeader("Grafico Temperature");
+    html += "<canvas id='c' style='width:100%;max-width:640px;height:300px;background:#111;border-radius:8px'></canvas>";
+    html += "<script>";
+    html += "const cv=document.getElementById('c');function resize(){cv.width=cv.clientWidth;cv.height=cv.clientHeight;}window.addEventListener('resize',resize);resize();";
+    html += "function draw(d){const ctx=cv.getContext('2d');const w=cv.width,h=cv.height;ctx.clearRect(0,0,w,h);";
+    html += "const max=500,pad=30;";
+    html += "ctx.strokeStyle='#444';ctx.beginPath();ctx.moveTo(pad,0);ctx.lineTo(pad,h-pad);ctx.lineTo(w,h-pad);ctx.stroke();";
+    html += "ctx.fillStyle='#888';ctx.font='11px sans-serif';";
+    html += "for(let g=0;g<=max;g+=100){const y=h-pad-(g/max)*(h-pad);ctx.fillText(g,2,y+4);ctx.strokeStyle='#222';ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w,y);ctx.stroke();}";
+    html += "function line(arr,color){if(arr.length<2)return;ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();";
+    html += "arr.forEach((v,i)=>{const x=pad+(i/(arr.length-1))*(w-pad);const y=h-pad-(Math.min(v,max)/max)*(h-pad);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();}";
+    html += "line(d.temperatures1,'#e74c3c');line(d.temperatures2,'#3498db');";
+    html += "ctx.fillStyle='#e74c3c';ctx.fillText('CIELO',w-70,14);ctx.fillStyle='#3498db';ctx.fillText('PLATEA',w-70,28);}";
+    html += "function update(){fetch('/temperature-data').then(r=>r.json()).then(draw);}";
+    html += "update();setInterval(update,10000);";
+    html += "</script>";
+    html += "<p><a href='/'><button>Torna al Monitor</button></a></p>";
+    html += pageFooter();
     server.send(200, "text/html", html);
 }
 
@@ -662,7 +832,7 @@ void handleSetTemp() {
     // Salva le impostazioni nella EEPROM
     saveSettings();
 
-    server.sendHeader("Location", "/");
+    server.sendHeader("Location", "/setting");
     server.send(303);
 }
 void updateDisplay() {
@@ -678,16 +848,16 @@ void updateDisplay() {
             //           (rele2Priority = true ? ST7735_ORANGE : ST7735_RED);
     tft.setTextColor(cieloColor);
     tft.setCursor(0, 65);
-    tft.print("CIELO : "); 
+    tft.print("CIELO : ");
     tft.setCursor(80, 65);
     tft.println(tempString1);
     tft.setFont(); // Resetta al font di default per altre informazioni
-    tft.setTextSize(1); 
+    tft.setTextSize(1);
     tft.setCursor(118, 50);
     tft.print("o");
     tft.setTextColor(ST7735_BLUE);
     tft.setCursor(85, 73);
-    //tft.print("SET:"); 
+    //tft.print("SET:");
     tft.println(tempString3);
     tft.setFont(&FreeSans9pt7b);
     //uint16_t plateaColor = digitalRead(rele2) == LOW ? ST7735_WHITE :
@@ -695,40 +865,40 @@ void updateDisplay() {
     tft.setTextColor(plateaColor);
     tft.setCursor(0, 100);
     tft.print("PLATEA: ");
-    tft.setCursor(80, 100); 
+    tft.setCursor(80, 100);
     tft.println(tempString2);
     tft.setFont(); // Resetta al font di default per altre informazioni
     tft.setTextSize(1);
     tft.setCursor(118, 85);
-    tft.print("o"); 
+    tft.print("o");
     tft.setTextColor(ST7735_BLUE);
     tft.setCursor(85, 108);
-   // tft.print("SET:"); 
+   // tft.print("SET:");
     tft.println(tempString4);
     tft.setFont(&FreeSans9pt7b);
     tft.setTextColor(ST7735_GREEN);
     tft.setCursor(0, 135);
     tft.print("TIMER: ");
-    tft.setCursor(80, 135); 
+    tft.setCursor(80, 135);
     tft.println(timerString);
     tft.setFont(); // Resetta al font di default per altre informazioni
     tft.setTextSize(1);
     tft.setCursor(118, 128);
-    tft.print("S"); 
+    tft.print("S");
     //tft.setTextColor(ST7735_BLUE);
     //tft.setCursor(130, 85);
-   // tft.print("SET:"); 
+   // tft.print("SET:");
    // tft.println(timerString);
     tft.setTextColor(ST7735_CYAN);
     tft.setCursor(5, 140);
-    //tft.print("Rele1"); 
+    //tft.print("Rele1");
     tft.print(rele1TimeString);
     tft.print(rele2TimeString);
     //tft.setTextColor(ST7735_CYAN);
     tft.setCursor(65, 140);
     tft.print("EURO: ");
-    tft.print(euroTotalString); 
-    
+    tft.print(euroTotalString);
+
     tft.setTextColor(ST7735_CYAN);
     tft.setCursor(5, 150);
     tft.print(wifiApMode ? "AP: " : "IP: ");
