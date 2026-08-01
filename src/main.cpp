@@ -446,9 +446,7 @@ void loop() {
             } else {
                 int randomMelody = random(0, 8);
                 for (int i = 0; i < 8; i++) {
-                    int frequency = melodies[randomMelody][i];
-                    playBuzzer(frequency, 200);
-                    delay(200);
+                    playBuzzer(melodies[randomMelody][i], 200);
                 }
 
              Serial.println("Fine del conto alla rovescia. Inizio conteggio tempo.");
@@ -946,7 +944,9 @@ void updateDisplay() {
     tft.println(wifiApMode ? WiFi.softAPIP() : WiFi.localIP());
 }
 void playBuzzer(int frequency, int duration) {
-  tone(buzzerPin, frequency, duration);
+  // Suona per il 90% della durata cosi' le note restano distinguibili invece
+  // di suonare legate; il 10% restante e' un breve silenzio tra una nota e l'altra.
+  tone(buzzerPin, frequency, (duration * 9) / 10);
   delay(duration);
   noTone(buzzerPin);
 }
