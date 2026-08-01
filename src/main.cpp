@@ -42,11 +42,15 @@ const int rele2 = 17;
 
 // Controllo potenza tramite PWM lento a 2Hz (periodo 500ms): ogni relè viene
 // pilotato in modo indipendente con un duty cycle proprio, cosi' la spia al
-// neon collegata resta visibilmente intermittente. CIELO (2,2kW) e PLATEA
-// (0,9kW) possono essere accese insieme.
+// neon collegata resta visibilmente intermittente. CIELO (2400W) e PLATEA
+// (900W) possono essere accese insieme, ma la linea/contatore condiviso
+// regge al massimo MAX_COMBINED_POWER_W: se le percentuali impostate
+// supererebbero il limite, viene ridotta automaticamente solo la PLATEA
+// (il CIELO non viene mai toccato dal limite di potenza).
 const unsigned long PWM_PERIOD_MS = 500; // 2Hz
-const float RELE1_POWER_KW = 2.2; // CIELO
-const float RELE2_POWER_KW = 0.9; // PLATEA
+const float RELE1_POWER_W = 2400.0; // CIELO
+const float RELE2_POWER_W = 900.0;  // PLATEA
+const float MAX_COMBINED_POWER_W = 2800.0;
 const float ENERGY_PRICE_EUR_KWH = 0.40;
 float potenza1 = 100.0; // percentuale di potenza manuale per il relè 1 (CIELO), usata a target raggiunto
 float potenza2 = 100.0; // percentuale di potenza manuale per il relè 2 (PLATEA), usata a target raggiunto
@@ -509,21 +513,24 @@ if (startChrono) {
 
 
 }
-euroTotal = ((rele2MinutesTotal / 60.0) * RELE2_POWER_KW + (rele1MinutesTotal / 60.0) * RELE1_POWER_KW) * ENERGY_PRICE_EUR_KWH;
+euroTotal = ((rele2MinutesTotal / 60.0) * (RELE2_POWER_W / 1000.0) + (rele1MinutesTotal / 60.0) * (RELE1_POWER_W / 1000.0)) * ENERGY_PRICE_EUR_KWH;
 euroTotalDecimali = (int)((euroTotal - (int)euroTotal) * 100);
 
 }
 
 // Decide se le due zone hanno bisogno di calore (isteresi di sicurezza) e calcola
-// la potenza (%) da erogare a ciascuna in base alla fase di cottura:
-//  1) lontani dal target (>40 gradi dal setpoint CIELO): preriscaldo a spinta
-//     massima, CIELO 50% fisso e PLATEA 100% fisso;
-//  2) avvicinamento (entro 40 gradi dal target CIELO, ma non ancora entrambe
-//     a target): CIELO alla potenza impostata dall'utente, PLATEA 50% fisso;
+// la potenza (%) da erogare a ciascuna in base alla fase di cottura. La PLATEA,
+// avendo molta più inerzia termica, guida la fase (non il CIELO):
+//  1) PLATEA lontana dal proprio target (>40 gradi dal setpoint PLATEA):
+//     preriscaldo a spinta massima, CIELO 50% fisso e PLATEA 100% fisso;
+//  2) avvicinamento (PLATEA entro 40 gradi dal proprio target, ma non ancora
+//     entrambe a target): CIELO alla potenza impostata dall'utente, PLATEA 50% fisso;
 //  3) mantenimento (entrambe le zone a target): ciascuna alla propria potenza
 //     impostata, tranne che se il CIELO e' oltre il 70% e la PLATEA deve
 //     riaccendersi, nel qual caso il CIELO viene abbassato al 50% per
 //     contenere l'assorbimento combinato.
+// In ogni fase, se la potenza risultante supererebbe MAX_COMBINED_POWER_W
+// (limite della linea/contatore condiviso), viene ridotta solo la PLATEA.
 // Ogni relè viene poi pilotato in modo indipendente (possono stare accesi
 // insieme) con un PWM lento a 2Hz (PWM_PERIOD_MS), cosi' le spie al neon
 // restano visibilmente intermittenti.
@@ -535,11 +542,14 @@ void updateRelayControl(unsigned long now) {
     if (temperature2 <= tempimpostata2 - deltaT2) demand2 = true;
     if (temperature2 > tempimpostata2 + deltaT2) demand2 = false;
 
-    float dist1 = tempimpostata1 - temperature1;
+    // La PLATEA ha molta più inerzia termica del CIELO: all'avvio ha priorità
+    // (100% di potenza) finché non si avvicina al proprio target, mentre il
+    // CIELO (che scalda molto più in fretta) resta al minimo indispensabile (50%).
+    float dist2 = tempimpostata2 - temperature2;
     bool bothReached = (temperature1 >= tempimpostata1) && (temperature2 >= tempimpostata2);
 
     float targetPower1, targetPower2;
-    if (dist1 > 40) {
+    if (dist2 > 40) {
         targetPower1 = 50;
         targetPower2 = 100;
     } else if (!bothReached) {
@@ -551,6 +561,17 @@ void updateRelayControl(unsigned long now) {
         if (targetPower1 > 70 && demand2) {
             targetPower1 = 50;
         }
+    }
+
+    // Limite di potenza combinata (linea/contatore condiviso): se le percentuali
+    // risultanti superano MAX_COMBINED_POWER_W, si riduce solo la PLATEA, mai il CIELO.
+    float watts1 = RELE1_POWER_W * (targetPower1 / 100.0f);
+    float watts2 = RELE2_POWER_W * (targetPower2 / 100.0f);
+    if (watts1 + watts2 > MAX_COMBINED_POWER_W) {
+        float maxWatts2 = MAX_COMBINED_POWER_W - watts1;
+        if (maxWatts2 < 0) maxWatts2 = 0;
+        float cappedPower2 = (maxWatts2 / RELE2_POWER_W) * 100.0f;
+        if (cappedPower2 < targetPower2) targetPower2 = cappedPower2;
     }
 
     unsigned long phase = now % PWM_PERIOD_MS;
@@ -656,7 +677,7 @@ void handleMonitor() {
 
 void handlePowerPage() {
     String html = pageHeader("Potenza resistenze");
-    html += "<p class='status'>Potenza applicata quando entrambe le zone hanno raggiunto il target (PWM a 2Hz, la spia al neon segue il duty cycle). Durante il preriscaldo e l'avvicinamento al target la potenza è gestita automaticamente: CIELO 50% / PLATEA 100% se si è a più di 40&deg; dal target, poi CIELO alla % qui impostata / PLATEA 50% fino al raggiungimento di entrambe. Se il CIELO è oltre il 70%, quando la PLATEA si riaccende il CIELO viene abbassato al 50%.</p>";
+    html += "<p class='status'>Potenza applicata quando entrambe le zone hanno raggiunto il target (PWM a 2Hz, la spia al neon segue il duty cycle). Durante il preriscaldo e l'avvicinamento al target la potenza è gestita automaticamente: PLATEA 100% / CIELO 50% finché la PLATEA è a più di 40&deg; dal target (ha più inerzia termica), poi CIELO alla % qui impostata / PLATEA 50% fino al raggiungimento di entrambe. Se il CIELO è oltre il 70%, quando la PLATEA si riaccende il CIELO viene abbassato al 50%. La linea condivisa regge al massimo 2800W: se le percentuali impostate la supererebbero, viene ridotta automaticamente solo la PLATEA.</p>";
     html += "<form class='card' action='/setpower' method='POST'>";
     html += "<label>Potenza CIELO: <span id='v1'>" + String(potenza1, 0) + "</span>%";
     html += "<input type='range' min='0' max='100' name='potenza1' value='" + String(potenza1, 0) + "' oninput=\"v1.textContent=this.value\"></label>";
