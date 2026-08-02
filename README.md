@@ -11,7 +11,7 @@ ricette salvabili e aggiornamento firmware via OTA.
 - 2x termocoppia tipo K con moduli **MAX6675** (CIELO e PLATEA), sullo stesso bus SPI software,
   lette a rotazione
 - 2x relè allo stato solido (SSR) che pilotano le resistenze CIELO (2400 W) e PLATEA (900 W)
-- Pulsante **touch capacitivo** (pin `T5`) per impostare un timer di cottura
+- Pulsante **touch capacitivo** (pin `T9` / GPIO32) per impostare un timer di cottura
 - Buzzer per segnalazioni acustiche a fine timer
 
 ### Pin utilizzati
@@ -23,7 +23,7 @@ ricette salvabili e aggiornamento firmware via OTA.
 | TFT CS          | 27   |
 | TFT DC          | 5    |
 | Buzzer          | 33   |
-| Touch (timer)   | T5   |
+| Touch (timer)   | T9 (GPIO32) |
 | Relè CIELO      | 22   |
 | Relè PLATEA     | 17   |
 | Termocoppie DO  | 15   |

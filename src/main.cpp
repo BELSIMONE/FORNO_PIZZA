@@ -36,7 +36,7 @@ std::vector<float> temperatureReadings;
 std::vector<float> temperatureReadings2;
 const int maxReadings = 120;
 const int buzzerPin = 33 ;  //  buzzer
-const int touchPin = T5;  // pulsante touch
+const int touchPin = T9;  // pulsante touch (GPIO32)
 const int rele1 = 22;
 const int rele2 = 17;
 
